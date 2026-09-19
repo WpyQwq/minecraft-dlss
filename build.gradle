@@ -1,0 +1,141 @@
+plugins {
+	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+version = project.version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+	// Loom adds the essential maven repositories automatically.
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+// ---------------------------------------------------------------------------
+// Bundled payload
+//
+// `payload/jvm/` mirrors the layout of the JVM's own bin/ directory, because
+// that is where everything has to end up: ReShade works as a *proxy DLL*, so
+// `opengl32.dll` must sit next to javaw.exe, and the ReShade add-ons load from
+// the directory of the ReShade DLL.
+//
+// NVIDIA's nvngx_dlss.dll (~59 MB) and nvngx_dlssnr.dll (~166 MB) account for
+// 95% of the total size. They are NOT committed to the repository and are NOT
+// bundled by default: the installer locates an existing copy on disk instead
+// (which is also what Deep Fried Chicken's own installer does). Ship them
+// inside the jar only when you deliberately want a single-file distribution:
+//
+//     gradlew build -PbundleNvidia=true -PngxSourceDir=H:/javahome/bin
+// ---------------------------------------------------------------------------
+def bundleNvidia  = (project.findProperty('bundleNvidia') ?: 'false').toString().toBoolean()
+def ngxSourceDir  = (project.findProperty('ngxSourceDir') ?: 'H:/javahome/bin').toString()
+def payloadSrc    = file('payload')
+def payloadInJar  = 'assets/wpywdlss/payload'
+
+// SHA-256 of every bundled file, generated at build time and verified after
+// extraction by the installer so a truncated download is caught immediately.
+def manifestFile = layout.buildDirectory.file('generated/payload-manifest.txt')
+
+tasks.register('payloadManifest') {
+	group = 'wpywdlss'
+	description = 'Generates SHA-256 manifest for the bundled payload'
+	def outFile = manifestFile.get().asFile
+	def ngxDir = new File(ngxSourceDir)
+	outputs.file(manifestFile)
+	outputs.upToDateWhen { false }
+	doLast {
+		def lines = []
+		def addAll = { File root, String prefix ->
+			if (!root.isDirectory()) return
+			root.eachFileRecurse { f ->
+				if (f.isFile()) {
+					def rel = prefix + f.absolutePath.substring(root.absolutePath.length() + 1).replace('\\', '/')
+					def md = java.security.MessageDigest.getInstance('SHA-256')
+					def hash = md.digest(f.bytes).encodeHex().toString().toUpperCase()
+					lines << (hash + '  ' + rel + '  ' + f.length())
+				}
+			}
+		}
+		addAll(payloadSrc, '')
+		if (bundleNvidia) {
+			['nvngx_dlss.dll', 'nvngx_dlssnr.dll'].each { n ->
+				def f = new File(ngxDir, n)
+				if (f.isFile()) {
+					def md = java.security.MessageDigest.getInstance('SHA-256')
+					def hash = md.digest(f.bytes).encodeHex().toString().toUpperCase()
+					lines << (hash + '  jvm/' + n + '  ' + f.length())
+				} else {
+					logger.warn("bundleNvidia=true but ${f} does not exist")
+				}
+			}
+		}
+		outFile.parentFile.mkdirs()
+		outFile.text = lines.sort().join('\n') + '\n'
+		logger.lifecycle("payload manifest: ${lines.size()} file(s) -> ${outFile}")
+	}
+}
+
+processResources {
+	// payload/jvm/** becomes assets/wpywdlss/payload/jvm/**
+	from(payloadSrc) {
+		into payloadInJar
+	}
+	from(manifestFile) {
+		into payloadInJar
+	}
+	if (bundleNvidia) {
+		from(ngxSourceDir) {
+			include 'nvngx_dlss.dll', 'nvngx_dlssnr.dll'
+			into payloadInJar + '/jvm'
+		}
+	}
+	dependsOn 'payloadManifest'
+
+	def version = project.version
+	inputs.property "version", version
+	inputs.property "bundleNvidia", bundleNvidia
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+jar {
+	def projectName = project.name
+	inputs.property "projectName", projectName
+
+	from("LICENSE") {
+		rename { "${it}_$projectName" }
+	}
+}
+
+tasks.named('build') {
+	doLast {
+		def jarFile = file("${layout.buildDirectory.get()}/libs/${project.archives_base_name}-${project.version}.jar")
+		if (jarFile.exists()) {
+			logger.lifecycle("")
+			logger.lifecycle("  mod jar : ${jarFile}")
+			logger.lifecycle("  size    : ${String.format('%.2f', jarFile.length() / 1048576.0)} MB")
+			logger.lifecycle("  nvidia  : ${bundleNvidia ? 'BUNDLED (large)' : 'not bundled - installer locates on disk'}")
+			logger.lifecycle("")
+		}
+	}
+}
